@@ -1,0 +1,218 @@
+import json
+import csv
+import re
+import sys
+from pathlib import Path
+from datetime import datetime
+
+import msal
+import requests
+
+TENANT_ID = "YOUR_TENANT_ID"
+CLIENT_ID = "YOUR_CLIENT_ID"
+CLIENT_SECRET = "YOUR_CLIENT_SECRET"
+
+GRAPH_BASE = "https://graph.microsoft.com"
+TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+BACKUP_ROOT = Path(f"Intune_Backup_{TIMESTAMP}")
+ERROR_LOG = BACKUP_ROOT / "backup_errors.log"
+
+ENDPOINTS = {
+    "configuration_policies": "/beta/deviceManagement/configurationPolicies",
+    "device_configurations": "/beta/deviceManagement/deviceConfigurations",
+    "compliance_policies": "/beta/deviceManagement/deviceCompliancePolicies",
+    "managed_app_policies": "/beta/deviceAppManagement/managedAppPolicies",
+    "mobile_app_configurations": "/beta/deviceAppManagement/mobileAppConfigurations",
+    "targeted_managed_app_configurations": "/beta/deviceAppManagement/targetedManagedAppConfigurations",
+    "device_management_scripts": "/beta/deviceManagement/deviceManagementScripts",
+    "device_health_scripts": "/beta/deviceManagement/deviceHealthScripts",
+    "device_compliance_scripts": "/beta/deviceManagement/deviceComplianceScripts",
+    "device_shell_scripts": "/beta/deviceManagement/deviceShellScripts",
+    "custom_attribute_scripts": "/beta/deviceManagement/deviceCustomAttributeShellScripts",
+}
+
+SUMMARY_ROWS = []
+
+def authenticate():
+    print("=" * 65)
+    print("AUTHENTICATING TO MICROSOFT GRAPH")
+    print("=" * 65)
+    app = msal.ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+        client_credential=CLIENT_SECRET,
+    )
+    token_result = app.acquire_token_for_client(
+        scopes=["https://graph.microsoft.com/.default"]
+    )
+    if "access_token" not in token_result:
+        print("\nAuthentication FAILED\n")
+        print(json.dumps(token_result, indent=2))
+        sys.exit(1)
+    print("Authentication successful.\n")
+    return token_result["access_token"]
+
+def log_error(message):
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    with ERROR_LOG.open("a", encoding="utf-8") as f:
+        f.write(f"[{datetime.now()}] {message}\n")
+
+def graph_get(token, url):
+    if url.startswith("/"):
+        url = GRAPH_BASE + url
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    r = requests.get(url, headers=headers, timeout=60)
+    if not r.ok:
+        raise RuntimeError(f"HTTP {r.status_code}\nURL: {url}\n{r.text}")
+    return r.json()
+
+def get_all(token, endpoint):
+    out = []
+    data = graph_get(token, endpoint)
+    out.extend(data.get("value", []))
+    nxt = data.get("@odata.nextLink")
+    while nxt:
+        print("      Reading next page...")
+        data = graph_get(token, nxt)
+        out.extend(data.get("value", []))
+        nxt = data.get("@odata.nextLink")
+    return out
+
+def safe_filename(name):
+    name = name or "unnamed"
+    return re.sub(r'[<>:"/\\|?*]', "_", name)[:140]
+
+def save_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def get_relationship(token, base_url, relationship):
+    try:
+        return graph_get(token, f"{base_url}/{relationship}")
+    except Exception as e:
+        log_error(f"{base_url}/{relationship} -> {e}")
+        return {"_backup_error": str(e)}
+
+def export_configuration_policy(token, policy):
+    pid = policy["id"]
+    base = f"/beta/deviceManagement/configurationPolicies/{pid}"
+    full = graph_get(token, base)
+    print("      Getting settings...")
+    full["_settings"] = get_relationship(token, base, "settings")
+    print("      Getting assignments...")
+    full["_assignments"] = get_relationship(token, base, "assignments")
+    return full
+
+def export_generic_policy(token, endpoint, policy):
+    pid = policy["id"]
+    base = f"{endpoint}/{pid}"
+    full = graph_get(token, base)
+    full["_assignments"] = get_relationship(token, base, "assignments")
+    return full
+
+def classify_endpoint_security(policy):
+    name = (policy.get("name") or policy.get("displayName") or "").lower()
+    tr = policy.get("templateReference", {}) or {}
+    tf = (tr.get("templateFamily", "") or "").lower()
+    text = f"{name} {tf}"
+    if "antivirus" in text: return "antivirus"
+    if "firewall" in text: return "firewall"
+    if "attack surface" in text or "asr" in text: return "attack_surface_reduction"
+    if "disk encryption" in text or "bitlocker" in text: return "disk_encryption"
+    if "endpoint detection" in text or "edr" in text: return "endpoint_detection_response"
+    if "account protection" in text or "laps" in text: return "account_protection"
+    if "security baseline" in text: return "security_baselines"
+    return "other"
+
+def add_summary(category, policy, backup_error=""):
+    SUMMARY_ROWS.append({
+        "category": category,
+        "name": policy.get("name") or policy.get("displayName") or "",
+        "id": policy.get("id", ""),
+        "odata_type": policy.get("@odata.type", ""),
+        "platforms": str(policy.get("platforms", "")),
+        "technologies": str(policy.get("technologies", "")),
+        "created": policy.get("createdDateTime", ""),
+        "modified": policy.get("lastModifiedDateTime", ""),
+        "backup_error": backup_error,
+    })
+
+def export_category(token, category, endpoint):
+    print("\n" + "=" * 65)
+    print(f"EXPORTING: {category}")
+    print("=" * 65)
+    folder = BACKUP_ROOT / category
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        policies = get_all(token, endpoint)
+    except Exception as e:
+        print(f"FAILED TO READ CATEGORY: {e}")
+        log_error(f"{category}: {e}")
+        save_json(folder / "_CATEGORY_ERROR.json", {"error": str(e)})
+        return
+    print(f"Objects found: {len(policies)}")
+    save_json(folder / "_all_objects.json", policies)
+
+    for i, policy in enumerate(policies, 1):
+        pid = policy.get("id", "unknown")
+        name = policy.get("name") or policy.get("displayName") or pid
+        print(f"\n[{i}/{len(policies)}] {name}")
+        try:
+            if category == "configuration_policies":
+                full = export_configuration_policy(token, policy)
+            else:
+                full = export_generic_policy(token, endpoint, policy)
+            err = ""
+        except Exception as e:
+            print(f"      Error: {e}")
+            log_error(f"{category} / {name}: {e}")
+            full = dict(policy)
+            full["_backup_error"] = str(e)
+            err = str(e)
+
+        filename = f"{safe_filename(name)}__{pid}.json"
+        save_json(folder / filename, full)
+        add_summary(category, policy, err)
+
+        if category == "configuration_policies":
+            sec = classify_endpoint_security(full)
+            sf = BACKUP_ROOT / "endpoint_security" / sec
+            sf.mkdir(parents=True, exist_ok=True)
+            save_json(sf / filename, full)
+
+def save_summary():
+    path = BACKUP_ROOT / "summary.csv"
+    fields = ["category","name","id","odata_type","platforms","technologies","created","modified","backup_error"]
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(SUMMARY_ROWS)
+
+def main():
+    print("\n" + "*" * 65)
+    print("FULL MICROSOFT INTUNE POLICY BACKUP")
+    print("Python + Microsoft Graph")
+    print("*" * 65)
+    BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+    token = authenticate()
+    for category, endpoint in ENDPOINTS.items():
+        export_category(token, category, endpoint)
+    save_summary()
+    print("\n" + "*" * 65)
+    print("BACKUP FINISHED")
+    print("*" * 65)
+    print(f"\nBackup folder:\n{BACKUP_ROOT.resolve()}")
+    print(f"\nTotal objects exported: {len(SUMMARY_ROWS)}")
+    if ERROR_LOG.exists():
+        print("\nSome endpoints returned errors.")
+        print(f"Review:\n{ERROR_LOG.resolve()}")
+    else:
+        print("\nNo errors were recorded.")
+
+if __name__ == "__main__":
+    main()
