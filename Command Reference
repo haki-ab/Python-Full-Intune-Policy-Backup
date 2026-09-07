@@ -1,0 +1,13 @@
+Command Reference
+# Install dependencies
+py -m pip install msal requests
+
+# Run full backup
+py intune_full_backup.py
+
+# Deploy the approved improved policy
+py restore_android_compliance_policy.py
+
+# Expected success
+# HTTP Status: 201
+# Policy created successfully.
