@@ -1,0 +1,80 @@
+import json
+import sys
+from pathlib import Path
+
+import msal
+import requests
+
+TENANT_ID = "YOUR_TENANT_ID"
+CLIENT_ID = "YOUR_CLIENT_ID"
+CLIENT_SECRET = "YOUR_CLIENT_SECRET"
+
+POLICY_FILE = Path("CORP-Android-FullyManaged-Compliance-v2-fixed.json")
+GRAPH_URL = "https://graph.microsoft.com/beta/deviceManagement/deviceCompliancePolicies"
+
+def authenticate():
+    app = msal.ConfidentialClientApplication(
+        CLIENT_ID,
+        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
+        client_credential=CLIENT_SECRET,
+    )
+    token = app.acquire_token_for_client(
+        scopes=["https://graph.microsoft.com/.default"]
+    )
+    if "access_token" not in token:
+        print("Authentication failed:")
+        print(json.dumps(token, indent=2))
+        sys.exit(1)
+    return token["access_token"]
+
+def load_policy():
+    if not POLICY_FILE.exists():
+        print(f"Policy file not found: {POLICY_FILE.resolve()}")
+        sys.exit(1)
+    return json.loads(POLICY_FILE.read_text(encoding="utf-8"))
+
+def create_policy(token, policy):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    response = requests.post(
+        GRAPH_URL,
+        headers=headers,
+        json=policy,
+        timeout=60,
+    )
+
+    print("HTTP Status:", response.status_code)
+
+    if response.status_code == 201:
+        created = response.json()
+        print("\nPolicy created successfully.")
+        print("Display name:", created.get("displayName"))
+        print("Policy ID:", created.get("id"))
+        Path("created_policy_response.json").write_text(
+            json.dumps(created, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+        return
+
+    print("\nGraph rejected the policy.")
+    print(response.text)
+    sys.exit(1)
+
+def main():
+    print("=" * 65)
+    print("INTUNE ANDROID COMPLIANCE POLICY CREATE")
+    print("=" * 65)
+
+    policy = load_policy()
+    print("\nPayload:")
+    print(json.dumps(policy, indent=2, ensure_ascii=False))
+
+    token = authenticate()
+    print("\nAuthenticated to Microsoft Graph.")
+    create_policy(token, policy)
+
+if __name__ == "__main__":
+    main()
